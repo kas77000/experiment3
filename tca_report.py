@@ -273,6 +273,7 @@ def ordertype_all(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def ordertype_per_strategy(df: pd.DataFrame) -> pd.DataFrame:
+    """Combined overview: one stacked table, a Strategy column + order-type rows."""
     rows = []
     for strat, gs in df.groupby("strategy", observed=True):
         for mkt, g in gs.groupby("mkt", observed=True):
@@ -284,6 +285,23 @@ def ordertype_per_strategy(df: pd.DataFrame) -> pd.DataFrame:
     cols = ["Strategy"] + OT_COLUMNS
     out = pd.DataFrame(rows, columns=cols)
     return out.sort_values(["Strategy", "Order Type"]).reset_index(drop=True)
+
+
+def ordertype_by_strategy_split(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """One standalone order-type table per strategy (Market / Limit / All rows).
+
+    Returns ``{strategy: order-type table}`` ordered by executed notional, so the
+    biggest strategies come first in the report.
+    """
+    order = (df.groupby("strategy", observed=True)["notional"].sum()
+             .sort_values(ascending=False).index)
+    out: dict[str, pd.DataFrame] = {}
+    for strat in order:
+        gs = df[df["strategy"] == strat]
+        rows = [_ot_row(mkt, g) for mkt, g in gs.groupby("mkt", observed=True)]
+        rows.append(_ot_row("All order types", gs))
+        out[str(strat)] = pd.DataFrame(rows, columns=OT_COLUMNS)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -701,11 +719,26 @@ def _fig_table(df: pd.DataFrame, title: str, note: str | None = None,
             disp[c] = disp[c].map(lambda v: float_fmt.format(v) if np.isfinite(v) else "")
         else:
             disp[c] = disp[c].astype(str)
-    tbl = ax.table(cellText=disp.values, colLabels=disp.columns,
+    # shorter headers so wide tables don't overlap in the fixed-width figure
+    abbrev = {
+        "Arrival Slippage (bps)": "Arrival\n(bps)",
+        "Open Slippage (bps)": "Open\n(bps)",
+        "Close Slippage (bps)": "Close\n(bps)",
+        "PVWAP Slippage (bps)": "PVWAP\n(bps)",
+        "Fill Rate (%)": "Fill %",
+        "Spread (bps)": "Spread\n(bps)",
+        "Notional (USD m)": "Notional\n(USD m)",
+        "Avg Spread (bps)": "Avg Sprd\n(bps)",
+        "Low dark (<15%) bps": "Low dark\n(<15%)",
+        "High dark (>=30%) bps": "High dark\n(≥30%)",
+        "Dark benefit (bps)": "Dark\nbenefit",
+    }
+    labels = [abbrev.get(c, c) for c in disp.columns]
+    tbl = ax.table(cellText=disp.values, colLabels=labels,
                    cellLoc="center", loc="upper center")
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(8.5 if disp.shape[1] > 8 else 9.5)
-    tbl.scale(1, 1.4)
+    tbl.scale(1, 1.7)
     for (r, c), cell in tbl.get_celld().items():
         cell.set_edgecolor("#D7DEDC")
         if r == 0:
@@ -750,9 +783,14 @@ def build_pdf(path: Path, ctx: dict) -> None:
         pdf.savefig(_fig_table(ctx["ot_all"], "1 · Total slippage breakdown by order type",
                                "All strategies · notional-weighted · + = good / − = cost"))
         plt.close("all")
-        pdf.savefig(_fig_table(ctx["ot_strat"], "2 · Slippage breakdown by order type per strategy",
+        pdf.savefig(_fig_table(ctx["ot_strat"],
+                               "2 · Slippage breakdown by order type per strategy — overview",
                                "Notional-weighted · + = good / − = cost"))
         plt.close("all")
+        for i, (strat, tbl) in enumerate(ctx["ot_strat_split"].items(), start=1):
+            pdf.savefig(_fig_table(tbl, f"2.{i} · Order type breakdown — {strat}",
+                                   "Notional-weighted · + = good / − = cost"))
+            plt.close("all")
         pdf.savefig(_fig_table(ctx["dark_tbl"], "3 · Slippage by dark participation",
                                "Notional-weighted by %DARK bucket", float_fmt="{:.2f}"))
         plt.close("all")
@@ -847,9 +885,12 @@ def build_xlsx(path: Path, ctx: dict) -> None:
                 "Notional-weighted average by executed notional (USD)")
     ws2 = wb.create_sheet("Order Type — Strategy")
     ws2.sheet_view.showGridLines = False
-    write_table(ws2, ctx["ot_strat"], 1,
-                "Slippage Breakdown by Order Type per Strategy",
-                "Notional-weighted average by executed notional (USD)")
+    nr = write_table(ws2, ctx["ot_strat"], 1,
+                     "Slippage Breakdown by Order Type per Strategy — overview",
+                     "Notional-weighted average by executed notional (USD)")
+    for strat, tbl in ctx["ot_strat_split"].items():
+        nr = write_table(ws2, tbl, nr, f"Strategy: {strat}",
+                         "Notional-weighted · + = good / − = cost")
 
     # ---- Dark analysis sheet ----
     wd = wb.create_sheet("Dark Analysis")
@@ -971,6 +1012,7 @@ def main(argv: list[str] | None = None) -> int:
     # ---- tables ----
     ot_all = ordertype_all(df)
     ot_strat = ordertype_per_strategy(df)
+    ot_strat_split = ordertype_by_strategy_split(df)
     dark_tbl = dark_slippage_table(df)
     dark_size_tbl = dark_by_size_table(df)
     sv = dark_savings(df)
@@ -1007,7 +1049,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ctx = {
         "client": args.client, "period": period, "n_orders": len(df),
-        "ot_all": ot_all, "ot_strat": ot_strat,
+        "ot_all": ot_all, "ot_strat": ot_strat, "ot_strat_split": ot_strat_split,
         "dark_tbl": dark_tbl, "dark_size_tbl": dark_size_tbl, "sv": sv,
         "venue": venue, "venue_summary": venue_summary, "algo": algo,
         "summary_bullets": summary_bullets, "pdf_charts": charts,
