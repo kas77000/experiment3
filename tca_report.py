@@ -212,6 +212,12 @@ def load_orders(path: Path, cost_positive: bool) -> pd.DataFrame:
     df["side"] = (raw[keys["side"]].astype(str).str.strip().str.title()
                   if keys["side"] else "")
     df["sector"] = raw[keys["sector"]].astype(str).str.strip() if keys["sector"] else ""
+    # Country / listing venue from the Bloomberg-style ticker suffix ("01896 HK" -> HK)
+    if keys["sym"]:
+        tok = raw[keys["sym"]].astype(str).str.strip().str.split().str[-1]
+        df["country"] = tok.where(tok.str.fullmatch(r"[A-Za-z]{2,3}"), "Unknown").str.upper()
+    else:
+        df["country"] = "Unknown"
     df["date"] = pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
     if keys["date"]:
         df["date"] = pd.to_datetime(raw[keys["date"]], errors="coerce", format="mixed")
@@ -285,6 +291,37 @@ def ordertype_per_strategy(df: pd.DataFrame) -> pd.DataFrame:
     cols = ["Strategy"] + OT_COLUMNS
     out = pd.DataFrame(rows, columns=cols)
     return out.sort_values(["Strategy", "Order Type"]).reset_index(drop=True)
+
+
+BREAKDOWN_METRICS = ["# Orders", "Arrival Slippage (bps)", "PVWAP Slippage (bps)",
+                     "%ADV", "Volatility", "Spread (bps)", "Fill Rate (%)", "%DARK"]
+
+
+def _breakdown_row(g: pd.DataFrame) -> dict:
+    w = g["notional"]
+    return {
+        "# Orders": len(g),
+        "Arrival Slippage (bps)": wavg(g["is"], w),
+        "PVWAP Slippage (bps)": wavg(g["pvwap"], w),
+        "%ADV": float(g["pct_dv"].mean()),
+        "Volatility": float(g["vol"].mean()),
+        "Spread (bps)": float(g["sprd"].mean()),
+        "Fill Rate (%)": float(g["fr_pct"].mean()),
+        "%DARK": wavg(g["dark"], w),
+    }
+
+
+def breakdown_by(df: pd.DataFrame, keycol: str, keyname: str) -> pd.DataFrame:
+    """Notional-weighted slippage + %DARK, one row per ``keycol`` value (biggest first),
+    with an ``All`` total row. Used for the per-country and per-algo breakdowns."""
+    order = (df.groupby(keycol, observed=True)["notional"].sum()
+             .sort_values(ascending=False).index)
+    rows = []
+    for k in order:
+        g = df[df[keycol] == k]
+        rows.append({keyname: str(k), **_breakdown_row(g)})
+    rows.append({keyname: "All", **_breakdown_row(df)})
+    return pd.DataFrame(rows, columns=[keyname] + BREAKDOWN_METRICS)
 
 
 def ordertype_by_strategy_split(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
@@ -568,21 +605,35 @@ def chart_dark_by_size(tbl: pd.DataFrame, png: Path) -> Path:
 
 
 def chart_venue_split(venue: pd.DataFrame, png: Path) -> Path:
-    """Diverging routed-vs-executed by venue; gap = under/over-utilisation."""
+    """Per-venue stacked bar: one bar per venue split into a routed segment and an
+    executed segment, so each venue's routed vs executed reads as a single divided bar."""
     v = venue.copy().fillna(0.0)
-    v = v.sort_values(v.columns[-1], ascending=True)
     vcols = [c for c in ["Routed %", "Executed %"] if c in v.columns]
+    # biggest venues (by combined footprint) at the top
+    v["_tot"] = v[vcols].sum(axis=1)
+    v = v.sort_values("_tot", ascending=True)
+    venues = v["Venue"].tolist()
+    y = np.arange(len(venues))
     pal = {"Routed %": ACC3, "Executed %": DARKC}
-    long = v.melt(id_vars="Venue", value_vars=vcols, var_name="Type", value_name="pct")
+    txt = {"Routed %": INK, "Executed %": "white"}
 
     fig, ax = plt.subplots(figsize=(11, 0.6 * len(v) + 3))
-    sns.barplot(long, y="Venue", x="pct", hue="Type", order=v["Venue"].tolist(),
-                hue_order=vcols, palette=[pal[c] for c in vcols],
-                edgecolor="white", linewidth=0.6, ax=ax)
-    ax.set_xlabel("% of dark volume")
+    left = np.zeros(len(v))
+    for col in vcols:
+        vals = v[col].to_numpy()
+        ax.barh(y, vals, left=left, color=pal[col], edgecolor="white",
+                linewidth=0.8, label=col.replace(" %", ""))
+        for yi, (xv, lf) in enumerate(zip(vals, left)):
+            if xv > 1.5:  # only label segments wide enough to hold the text
+                ax.annotate(f"{xv:.1f}", (lf + xv / 2, yi), ha="center", va="center",
+                            fontsize=9, color=txt[col], fontweight="bold")
+        left += vals
+    ax.set_yticks(y)
+    ax.set_yticklabels(venues)
+    ax.set_xlabel("% of dark volume  (routed segment + executed segment)")
     ax.set_ylabel("")
     _titles(ax, "Routed vs executed volume by dark venue",
-            "gap between routed and executed = venue reach / capture headroom")
+            "each venue is one bar · routed and executed shown as two coloured segments")
     ax.grid(axis="x", color=GRID)
     ax.grid(visible=False, axis="y")
     ax.legend(loc="lower right", title="")
@@ -640,6 +691,72 @@ def chart_algo(algo: pd.DataFrame, png: Path) -> Path:
     _titles(ax, ttl)
     ax.grid(axis="x", color=GRID)
     ax.grid(visible=False, axis="y")
+    fig.savefig(png)
+    plt.close(fig)
+    return png
+
+
+# performance benchmark per algo -> (order-level df column, y-axis label).
+# Edit / extend this to remap benchmarks for a different set of strategies.
+ALGO_BENCHMARK = {
+    "VWAP":   ("pvwap", "Order PVWAP slippage (bps)"),
+    "IS":     ("is", "Arrival price slippage (bps)"),
+    "INLINE": ("is", "Arrival price slippage (bps)"),
+}
+DEFAULT_BENCHMARK = ("is", "Arrival price slippage (bps)")
+
+
+def _algo_benchmark(strategy: str) -> tuple[str, str]:
+    return ALGO_BENCHMARK.get(str(strategy).strip().upper(), DEFAULT_BENCHMARK)
+
+
+def chart_algo_dark_perf(df: pd.DataFrame, png: Path, min_orders: int = 5) -> Path | None:
+    """Small-multiples, one panel per algo: order-level performance vs %DARK.
+
+    Only orders that actually executed dark (``%DARK > 0``) are plotted. Each panel
+    scatters those orders (x = %DARK, y = the algo's benchmark slippage — VWAP → Order
+    PVWAP, IS/Inline → arrival price, others → arrival by default) and overlays a linear
+    trend line so the dark-vs-performance relationship is visible per strategy. Algos with
+    fewer than ``min_orders`` dark orders are skipped. Returns ``None`` if none qualify.
+    """
+    dark = df[df["dark"] > 0]
+    panels = []
+    for strat, g in dark.groupby("strategy", observed=True):
+        col, ylab = _algo_benchmark(strat)
+        x = pd.to_numeric(g["dark"], errors="coerce")
+        y = pd.to_numeric(g[col], errors="coerce")
+        m = x.notna() & y.notna()
+        if int(m.sum()) >= min_orders:
+            panels.append((str(strat), x[m].to_numpy(), y[m].to_numpy(), ylab))
+    if not panels:
+        return None
+    panels.sort(key=lambda p: -len(p[1]))               # busiest algos first
+
+    ncol = min(3, len(panels))
+    nrow = int(np.ceil(len(panels) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5.4 * ncol, 4.4 * nrow),
+                             squeeze=False)
+    for i, (strat, x, y, ylab) in enumerate(panels):
+        ax = axes[i // ncol][i % ncol]
+        ax.scatter(x, y, s=30, color=DARKC, alpha=0.5, edgecolor="white",
+                   linewidth=0.5, zorder=3)
+        if len(x) >= 2 and np.unique(x).size >= 2:
+            slope, intercept = np.polyfit(x, y, 1)
+            xs = np.linspace(x.min(), x.max(), 50)
+            ax.plot(xs, intercept + slope * xs, color=LITC, lw=2.6, zorder=4,
+                    label=f"trend  {slope:+.3f} bps / %dark")
+            ax.legend(loc="best", fontsize=9)
+        ax.axhline(0, color=MUTED, lw=1.1, ls=(0, (4, 3)))
+        ax.set_title(f"{strat}   ·   n={len(x)}", loc="left", fontsize=13.5)
+        ax.set_xlabel("Dark execution (%DARK)")
+        ax.set_ylabel(ylab, fontsize=10.5)
+    for j in range(len(panels), nrow * ncol):           # blank any unused cells
+        axes[j // ncol][j % ncol].axis("off")
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    fig.suptitle("Order-level performance vs dark execution, by algo",
+                 x=0.015, ha="left", y=0.995, fontsize=17, fontweight="bold", color=INK)
+    fig.text(0.015, 0.95, "each dot = one dark-executed order  ·  + = outperformance / − = cost",
+             ha="left", fontsize=10.5, color=MUTED)
     fig.savefig(png)
     plt.close(fig)
     return png
@@ -794,6 +911,12 @@ def build_pdf(path: Path, ctx: dict) -> None:
         pdf.savefig(_fig_table(ctx["dark_tbl"], "3 · Slippage by dark participation",
                                "Notional-weighted by %DARK bucket", float_fmt="{:.2f}"))
         plt.close("all")
+        pdf.savefig(_fig_table(ctx["country_tbl"], "4 · Slippage & dark participation by country",
+                               "Notional-weighted · + = good / − = cost · %DARK weighted by notional"))
+        plt.close("all")
+        pdf.savefig(_fig_table(ctx["algo_tbl"], "5 · Slippage & dark participation by algo",
+                               "Notional-weighted · + = good / − = cost · %DARK weighted by notional"))
+        plt.close("all")
 
         # ---- chart pages ----
         for png, title in ctx["pdf_charts"]:
@@ -913,6 +1036,16 @@ def build_xlsx(path: Path, ctx: dict) -> None:
     })
     write_table(wd, op, nr, "The dark opportunity (indicative)")
 
+    # ---- Country / algo breakdown sheet ----
+    wb2 = wb.create_sheet("Country & Algo")
+    wb2.sheet_view.showGridLines = False
+    nr = write_table(wb2, ctx["country_tbl"], 1,
+                     "Slippage & dark participation by country",
+                     "Notional-weighted · + = good / − = cost · %DARK weighted by notional")
+    write_table(wb2, ctx["algo_tbl"], nr,
+                "Slippage & dark participation by algo",
+                "Notional-weighted · + = good / − = cost · %DARK weighted by notional")
+
     # ---- Venue / algo sheets ----
     if ctx.get("venue") is not None:
         wv = wb.create_sheet("Venues")
@@ -1015,6 +1148,8 @@ def main(argv: list[str] | None = None) -> int:
     ot_strat_split = ordertype_by_strategy_split(df)
     dark_tbl = dark_slippage_table(df)
     dark_size_tbl = dark_by_size_table(df)
+    country_tbl = breakdown_by(df, "country", "Country")
+    algo_tbl = breakdown_by(df, "strategy", "Algo")
     sv = dark_savings(df)
 
     aux_dir = Path(args.aux_dir) if args.aux_dir else None
@@ -1034,14 +1169,17 @@ def main(argv: list[str] | None = None) -> int:
                    "Dark benefit by order size"))
     charts.append((chart_savings(sv, png_dir / "05_dark_savings.png"),
                    "The dark opportunity"))
+    dark_perf_png = chart_algo_dark_perf(df, png_dir / "06_algo_dark_perf.png")
+    if dark_perf_png is not None:
+        charts.append((dark_perf_png, "Performance vs dark execution by algo"))
     if venue is not None:
-        charts.append((chart_venue_split(venue, png_dir / "06_venue_split.png"),
+        charts.append((chart_venue_split(venue, png_dir / "07_venue_split.png"),
                        "Routed vs executed by venue"))
     if venue_summary is not None:
-        charts.append((chart_venue_summary(venue_summary, png_dir / "07_venue_summary.png"),
+        charts.append((chart_venue_summary(venue_summary, png_dir / "08_venue_summary.png"),
                        "Dark venue summary"))
     if algo is not None:
-        charts.append((chart_algo(algo, png_dir / "08_algo_summary.png"),
+        charts.append((chart_algo(algo, png_dir / "09_algo_summary.png"),
                        "Performance by algorithm"))
     print(f"Wrote {len(charts)} chart(s) -> {png_dir}")
 
@@ -1051,6 +1189,7 @@ def main(argv: list[str] | None = None) -> int:
         "client": args.client, "period": period, "n_orders": len(df),
         "ot_all": ot_all, "ot_strat": ot_strat, "ot_strat_split": ot_strat_split,
         "dark_tbl": dark_tbl, "dark_size_tbl": dark_size_tbl, "sv": sv,
+        "country_tbl": country_tbl, "algo_tbl": algo_tbl,
         "venue": venue, "venue_summary": venue_summary, "algo": algo,
         "summary_bullets": summary_bullets, "pdf_charts": charts,
     }
