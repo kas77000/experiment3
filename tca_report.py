@@ -686,18 +686,25 @@ def chart_venue_summary(vs: pd.DataFrame, png: Path) -> Path:
         return png
     d = vs[[cat, val]].copy()
     d[val] = pd.to_numeric(d[val], errors="coerce")
-    d = d.sort_values(val, ascending=True)
-    fig, ax = plt.subplots(figsize=(11, 0.6 * len(d) + 3))
-    sns.barplot(d, y=cat, x=val, order=d[cat].tolist(), hue=cat,
-                hue_order=d[cat].tolist(), palette=SEQ[:len(d)], legend=False,
-                edgecolor="white", linewidth=0.6, ax=ax)
-    for c in ax.containers:
-        ax.bar_label(c, fmt="%.1f", padding=3, fontsize=10)
-    ax.set_ylabel("")
-    ax.set_xlabel(val)
-    _titles(ax, "Dark venue summary")
-    ax.grid(axis="x", color=GRID)
-    ax.grid(visible=False, axis="y")
+    d = d.dropna(subset=[val])
+    d = d[d[val] > 0].sort_values(val, ascending=False)
+    if d.empty:
+        return png
+    labels = d[cat].astype(str).tolist()
+    values = d[val].to_numpy(dtype=float)
+    total = values.sum()
+    colors = [SEQ[i % len(SEQ)] for i in range(len(d))]
+
+    fig, ax = plt.subplots(figsize=(10, 6.5))
+    wedges, _ = ax.pie(values, colors=colors, startangle=90, counterclock=False,
+                       wedgeprops=dict(width=0.42, edgecolor="white", linewidth=1.6))
+    ax.set_aspect("equal")
+    ax.set_title("Dark venue summary", loc="left", pad=16)
+    ax.text(0, 0, val.replace("% Total ", "").replace("Total ", ""),
+            ha="center", va="center", fontsize=11, color=MUTED)
+    leg = [f"{lab}   ·   {v / total * 100:.1f}%" for lab, v in zip(labels, values)]
+    ax.legend(wedges, leg, loc="center left", bbox_to_anchor=(1.02, 0.5),
+              frameon=False, fontsize=10.5, title=f"share of {val}", title_fontsize=10)
     fig.savefig(png)
     plt.close(fig)
     return png
@@ -742,6 +749,9 @@ ALGO_BENCHMARK = {
 }
 DEFAULT_BENCHMARK = ("is", "Arrival price slippage (bps)")
 
+# Which algos to show in the per-algo dark-performance chart. Empty list = all algos.
+DARK_PERF_ALGOS = ["VWAP"]
+
 
 def _algo_benchmark(strategy: str) -> tuple[str, str]:
     return ALGO_BENCHMARK.get(str(strategy).strip().upper(), DEFAULT_BENCHMARK)
@@ -758,6 +768,9 @@ def chart_algo_dark_perf(df: pd.DataFrame, png: Path, min_orders: int = 5) -> Pa
     orders are skipped. Returns ``None`` if none qualify.
     """
     dark = df[df["dark"] > 0]
+    if DARK_PERF_ALGOS:
+        keep = {a.strip().upper() for a in DARK_PERF_ALGOS}
+        dark = dark[dark["strategy"].astype(str).str.strip().str.upper().isin(keep)]
     panels = []
     for strat, g in dark.groupby("strategy", observed=True):
         col, ylab = _algo_benchmark(strat)
@@ -784,7 +797,8 @@ def chart_algo_dark_perf(df: pd.DataFrame, png: Path, min_orders: int = 5) -> Pa
 
     ncol = min(3, len(panels))
     nrow = int(np.ceil(len(panels) / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(5.4 * ncol, 4.4 * nrow),
+    cellw, cellh = (9.0, 5.8) if len(panels) == 1 else (5.4, 4.4)
+    fig, axes = plt.subplots(nrow, ncol, figsize=(cellw * ncol, cellh * nrow),
                              squeeze=False)
     for i, (strat, x, y, adv, ylab) in enumerate(panels):
         ax = axes[i // ncol][i % ncol]
@@ -812,13 +826,16 @@ def chart_algo_dark_perf(df: pd.DataFrame, png: Path, min_orders: int = 5) -> Pa
                            markersize=np.sqrt(_size(v)), label=f"{v:g}%")
                     for v in ref_vals]
 
-    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    # spacing measured in inches (va="top" on both) so the title strip never collides
+    h = cellh * nrow
+    fig.tight_layout(rect=[0, 0, 1, 1 - 0.85 / h])
     fig.suptitle("Order-level performance vs dark execution, by algo",
-                 x=0.015, ha="left", y=0.995, fontsize=17, fontweight="bold", color=INK)
-    fig.text(0.015, 0.95, "each bubble = one dark-executed order · size = %ADV · "
-             "+ = outperformance / − = cost", ha="left", fontsize=10.5, color=MUTED)
+                 x=0.015, ha="left", va="top", y=1 - 0.10 / h,
+                 fontsize=16, fontweight="bold", color=INK)
+    fig.text(0.015, 1 - 0.48 / h, "each bubble = one dark-executed order · size = %ADV · "
+             "+ = outperformance / − = cost", ha="left", va="top", fontsize=10.5, color=MUTED)
     fig.legend(handles=size_handles, title="%ADV", loc="upper right",
-               bbox_to_anchor=(0.995, 0.99), fontsize=9, title_fontsize=9,
+               bbox_to_anchor=(0.995, 1 - 0.10 / h), fontsize=9, title_fontsize=9,
                labelspacing=1.5, borderpad=0.8, handletextpad=1.2, frameon=False)
     fig.savefig(png)
     plt.close(fig)
