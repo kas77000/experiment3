@@ -177,10 +177,15 @@ def _num(df: pd.DataFrame, col: str | None) -> pd.Series:
 
 
 def _as_pct(s: pd.Series) -> pd.Series:
-    """Return a 0..100 percentage: if the data looks like a 0..1 fraction, x100."""
+    """Return a 0..100 percentage: if the data looks like a 0..1 fraction, x100.
+
+    The scale is decided by the maximum, not a high quantile: a column with a big
+    mass at 0 (e.g. %DARK where most orders trade fully lit) has a 95th-percentile of
+    0, which would wrongly flag genuine 0..100 data as a fraction and inflate it x100.
+    """
     s = pd.to_numeric(s, errors="coerce")
     v = s.dropna()
-    if not v.empty and v.quantile(0.95) <= 1.5:
+    if not v.empty and v.max() <= 1.5:
         return s * 100.0
     return s
 
@@ -212,12 +217,10 @@ def load_orders(path: Path, cost_positive: bool) -> pd.DataFrame:
     df["side"] = (raw[keys["side"]].astype(str).str.strip().str.title()
                   if keys["side"] else "")
     df["sector"] = raw[keys["sector"]].astype(str).str.strip() if keys["sector"] else ""
-    # Country / listing venue from the ticker suffix: the code after the last "."
-    # ("0700.HK" -> HK), or after a space if there is no dot ("01896 HK" -> HK).
+    # Country / listing venue = the last 2 characters of the ticker
+    # ("0700.HK" / "01896 HK" -> HK, "AAPL.US" -> US).
     if keys["sym"]:
-        sym = raw[keys["sym"]].astype(str).str.strip()
-        code = sym.str.extract(r"[.\s]\s*([A-Za-z]{1,4})\s*$", expand=False)
-        df["country"] = code.fillna("Unknown").str.upper()
+        df["country"] = raw[keys["sym"]].astype(str).str.strip().str[-2:].str.upper()
     else:
         df["country"] = "Unknown"
     df["date"] = pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
@@ -347,33 +350,46 @@ def ordertype_by_strategy_split(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 # Dark-execution analytics
 # --------------------------------------------------------------------------- #
 
-DARK_BINS = [-0.01, 5, 15, 30, 50, 100.01]
-DARK_LABELS = ["<5%", "5-15%", "15-30%", "30-50%", "50%+"]
 SIZE_BINS = [-0.01, 1, 5, 15, 1e9]
 SIZE_LABELS = ["<1% ADV", "1-5% ADV", "5-15% ADV", "15%+ ADV"]
-DARK_NBUCKETS = 5  # target number of %DARK buckets when splitting by quantile
+
+# Fixed %DARK bucket boundaries applied to orders that traded some dark. Orders with
+# no dark execution (0%) are always split into their own "0% (no dark)" bucket.
+# These are just the interior cut-points, in %; edit this list to change the ranges:
+#   [30, 60]          -> "0–30%", "30–60%", "60%+"
+#   [10, 25, 40, 60]  -> "0–10%", "10–25%", "25–40%", "40–60%", "60%+"
+DARK_FIXED_CUTS = [30, 60]
 
 
-def dark_bucket(df: pd.DataFrame, n: int = DARK_NBUCKETS) -> pd.Series:
-    """Split orders into %DARK buckets that adapt to the data.
+def _dark_labels(cuts: list[float]) -> list[str]:
+    """Bucket labels for the positive-dark ranges defined by ``cuts`` (0% excluded)."""
+    labels, prev = [], 0
+    for c in cuts:
+        labels.append(f"{prev:g}–{c:g}%")
+        prev = c
+    labels.append(f"{prev:g}%+")
+    return labels
 
-    Uses ``n`` quantile (roughly equal-count) buckets so the split lands where the
-    orders actually are — finer resolution in the low range for a book that trades
-    little dark, a wider top bucket for the sparse tail. If %DARK is too concentrated
-    to form at least 3 distinct edges (e.g. almost everything at one value), it falls
-    back to the fixed [<5, 5-15, 15-30, 30-50, 50+] bands.
+
+def dark_bucket(df: pd.DataFrame) -> pd.Series:
+    """Assign each order to a fixed %DARK bucket.
+
+    Orders with no dark execution (0%) go to a dedicated "0% (no dark)" bucket so the
+    large fully-lit mass doesn't swamp the first range. Orders that traded dark are
+    split by the fixed ranges from ``DARK_FIXED_CUTS`` (edit that list to change them).
     """
     s = pd.to_numeric(df["dark"], errors="coerce")
-    v = s.dropna()
-    if not v.empty:
-        edges = np.unique(np.round(np.quantile(v, np.linspace(0, 1, n + 1)), 1))
-        if edges.size >= 3:
-            labels = [f"{a:g}–{b:g}%" for a, b in zip(edges[:-1], edges[1:])]
-            cut_edges = edges.astype(float).copy()
-            cut_edges[0] = float(v.min()) - 0.01     # make sure the min/max are captured
-            cut_edges[-1] = float(v.max()) + 0.01
-            return pd.cut(s, bins=cut_edges, labels=labels, include_lowest=True)
-    return pd.cut(s, bins=DARK_BINS, labels=DARK_LABELS)
+    cuts = list(DARK_FIXED_CUTS)
+    pos_labels = _dark_labels(cuts)
+    labels = ["0% (no dark)"] + pos_labels
+
+    out = pd.Series(pd.NA, index=s.index, dtype=object)
+    out[s <= 0] = "0% (no dark)"
+    pos = s > 0
+    if pos.any():
+        binned = pd.cut(s[pos], bins=[0.0] + cuts + [np.inf], labels=pos_labels)
+        out[pos] = binned.astype(object)
+    return pd.Categorical(out, categories=labels, ordered=True)
 
 
 def size_bucket(df: pd.DataFrame) -> pd.Series:
@@ -1174,6 +1190,14 @@ def main(argv: list[str] | None = None) -> int:
     sv = dark_savings(df)
 
     aux_dir = Path(args.aux_dir) if args.aux_dir else None
+    if aux_dir is None:
+        print("  ! no --aux-dir given: the venue and algo charts need the auxiliary CSVs "
+              "(dark_routed.csv, dark_executed.csv, dark_venue_summary.csv, algo_summary.csv).")
+    elif not aux_dir.exists():
+        print(f"  ! --aux-dir not found: {aux_dir}")
+    else:
+        have = sorted(p.name for p in aux_dir.glob("*.csv"))
+        print(f"  aux-dir {aux_dir} contains: {', '.join(have) if have else '(no .csv files)'}")
     venue = load_venue_split(aux_dir)
     venue_summary = _load_aux(aux_dir, "dark_venue_summary.csv")
     algo = _load_aux(aux_dir, "algo_summary.csv")
@@ -1198,12 +1222,20 @@ def main(argv: list[str] | None = None) -> int:
     if venue is not None:
         charts.append((chart_venue_split(venue, png_dir / "07_venue_split.png"),
                        "Routed vs executed by venue"))
+    else:
+        print("  ! skipped venue-split chart: need dark_routed.csv and/or dark_executed.csv "
+              "in --aux-dir, each with a venue column and a 'Routed %' / 'Executed %' column.")
     if venue_summary is not None:
         charts.append((chart_venue_summary(venue_summary, png_dir / "08_venue_summary.png"),
                        "Dark venue summary"))
+    else:
+        print("  ! skipped venue-summary chart: need dark_venue_summary.csv in --aux-dir "
+              "with a 'Venue Category' column and a '% Total Exec Value' / 'Shares' column.")
     if algo is not None:
         charts.append((chart_algo(algo, png_dir / "09_algo_summary.png"),
                        "Performance by algorithm"))
+    else:
+        print("  ! skipped algo-summary chart: need algo_summary.csv in --aux-dir.")
     print(f"Wrote {len(charts)} chart(s) -> {png_dir}")
 
     summary_bullets = build_summary_bullets(df, ot_all, dark_tbl, sv)
