@@ -138,7 +138,7 @@ ORDER_FIELDS = {
     "mkt":          ["marketLimit", "Market/Limit"],
     "shares":       ["#Shares", "Shares"],          # x 1000
     "mln":          ["$Mln", "Mln", "$mln"],        # x 1e6
-    "pct_dv":       ["%DV", "%ADV", "%Adv"],
+    "pct_dv":       ["%adv", "%ADV", "%Adv"],   # real participation-of-ADV (was mistakenly %DV)
     "epr":          ["ePR"],
     "fr":           ["FR"],
     "vol":          ["Vol", "Volatility"],
@@ -151,6 +151,9 @@ ORDER_FIELDS = {
     "dur":          ["Dur", "Duration"],
     "pvwap":        ["Pvwap"],
     "dark":         ["%DARK", "%Dark"],
+    "post":         ["%POST"],           # lit passive execution share
+    "take":         ["%TAKE"],           # lit aggressive execution share
+    "auc":          ["%AUCTION"],        # auction execution share (= %OPEN + %CLOSE)
 }
 
 # slippage columns that get sign-flipped when --cost-positive is set
@@ -236,6 +239,10 @@ def load_orders(path: Path, cost_positive: bool) -> pd.DataFrame:
     df["epr"] = _num(raw, keys["epr"])
     df["fr_pct"] = _as_pct(_num(raw, keys["fr"]))
     df["dark"] = _as_pct(_num(raw, keys["dark"]))
+    # execution-channel participation shares (dark + auction + take + post ≈ 100%)
+    df["post"] = _as_pct(_num(raw, keys["post"]))
+    df["take"] = _as_pct(_num(raw, keys["take"]))
+    df["auc"] = _as_pct(_num(raw, keys["auc"]))
     return df
 
 
@@ -299,7 +306,8 @@ def ordertype_per_strategy(df: pd.DataFrame) -> pd.DataFrame:
 
 
 BREAKDOWN_METRICS = ["# Orders", "Arrival Slippage (bps)", "PVWAP Slippage (bps)",
-                     "%ADV", "Volatility", "Spread (bps)", "Fill Rate (%)", "%DARK"]
+                     "%ADV", "Volatility", "Spread (bps)", "Fill Rate (%)",
+                     "Dark Exec (%)", "Auction Exec (%)", "Take Exec (%)", "Post Exec (%)"]
 
 
 def _breakdown_row(g: pd.DataFrame) -> dict:
@@ -312,7 +320,11 @@ def _breakdown_row(g: pd.DataFrame) -> dict:
         "Volatility": float(g["vol"].mean()),
         "Spread (bps)": float(g["sprd"].mean()),
         "Fill Rate (%)": float(g["fr_pct"].mean()),
-        "%DARK": wavg(g["dark"], w),
+        # execution-channel breakdown (notional-weighted), replacing the old single %DARK
+        "Dark Exec (%)": wavg(g["dark"], w),
+        "Auction Exec (%)": wavg(g["auc"], w),
+        "Take Exec (%)": wavg(g["take"], w),
+        "Post Exec (%)": wavg(g["post"], w),
     }
 
 
@@ -408,10 +420,12 @@ def dark_slippage_table(df: pd.DataFrame) -> pd.DataFrame:
             "%DARK bucket": b,
             "# Orders": len(g),
             "Notional (USD m)": float(w.sum()) / 1e6,
-            "Avg %DARK": float(g["dark"].mean()),
+            "Dark Exec (%)": wavg(g["dark"], w),
+            "Auction Exec (%)": wavg(g["auc"], w),
+            "Take Exec (%)": wavg(g["take"], w),
+            "Post Exec (%)": wavg(g["post"], w),
             "Arrival Slippage (bps)": wavg(g["is"], w),
             "PVWAP Slippage (bps)": wavg(g["pvwap"], w),
-            "ePvwap/Sprd": wavg(g["epvwap_sprd"], w),
             "Avg Spread (bps)": float(g["sprd"].mean()),
             "Avg %ADV": float(g["pct_dv"].mean()),
         })
@@ -580,13 +594,8 @@ def chart_dark_slippage(tbl: pd.DataFrame, png: Path) -> Path:
     ax.axhline(0, color=MUTED, lw=1.4, ls=(0, (4, 3)))
     ax.set_xlabel("Dark participation of the order (%DARK)")
     ax.set_ylabel("Notional-weighted slippage (bps)")
-    _titles(ax, "More dark participation → better execution",
+    _titles(ax, "Performance by %dark execution",
             "notional-weighted slippage by %DARK bucket   ·   + = outperformance")
-    # order-count annotation under each bucket
-    counts = dict(zip(tbl["%DARK bucket"], tbl["# Orders"]))
-    for xi, b in enumerate(order):
-        ax.annotate(f"n={int(counts[b])}", (xi, 0), xytext=(0, -22),
-                    textcoords="offset points", ha="center", color=MUTED, fontsize=9)
     ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=10, title="")
     fig.savefig(png)
     plt.close(fig)
@@ -807,10 +816,11 @@ def chart_algo_dark_perf(df: pd.DataFrame, png: Path, min_orders: int = 5) -> Pa
         if len(x) >= 2 and np.unique(x).size >= 2:
             slope, intercept = np.polyfit(x, y, 1)
             xs = np.linspace(x.min(), x.max(), 50)
-            ax.plot(xs, intercept + slope * xs, color=LITC, lw=2.6, zorder=4,
-                    label=f"trend  {slope:+.3f} bps / %dark")
-            ax.legend(loc="upper right", fontsize=9, frameon=True, facecolor="white",
-                      framealpha=0.75, edgecolor="none")
+            ax.plot(xs, intercept + slope * xs, color=LITC, lw=2.6, zorder=4)
+            # slope stays beside its own line; the "trend line" key now lives in the
+            # shared legend in the right margin, outside the panels.
+            ax.text(0.97, 0.96, f"{slope:+.3f} bps / %dark", transform=ax.transAxes,
+                    ha="right", va="top", fontsize=8.5, color=LITC, zorder=5)
         ax.axhline(0, color=MUTED, lw=1.1, ls=(0, (4, 3)))
         ax.set_title(f"{strat}", loc="left", fontsize=13.5)
         ax.set_xlabel("Dark execution (%DARK)")
@@ -827,16 +837,24 @@ def chart_algo_dark_perf(df: pd.DataFrame, png: Path, min_orders: int = 5) -> Pa
                            markersize=np.sqrt(_size(v)), label=f"{v:g}%")
                     for v in ref_vals]
 
-    # spacing measured in inches (va="top" on both) so the title strip never collides
+    # spacing measured in inches (va="top" on both) so the title strip never collides;
+    # right edge pulled in to 0.82 to reserve a margin for the legends.
     h = cellh * nrow
-    fig.tight_layout(rect=[0, 0, 1, 1 - 0.85 / h])
-    fig.suptitle("Order-level performance vs dark execution, by algo",
+    fig.tight_layout(rect=[0, 0, 0.82, 1 - 0.85 / h])
+    fig.suptitle("Order-level performance vs dark execution",
                  x=0.015, ha="left", va="top", y=1 - 0.10 / h,
                  fontsize=16, fontweight="bold", color=INK)
     fig.text(0.015, 1 - 0.48 / h, "each bubble = one dark-executed order · size = %ADV · "
              "+ = outperformance / − = cost", ha="left", va="top", fontsize=10.5, color=MUTED)
-    fig.legend(handles=size_handles, title="%ADV", loc="upper right",
-               bbox_to_anchor=(0.995, 1 - 0.10 / h), fontsize=9, title_fontsize=9,
+
+    # both legends sit in the reserved right margin, stacked, OUTSIDE the panel grid
+    trend_handle = Line2D([0], [0], color=LITC, lw=2.6, label="trend line")
+    leg_perf = fig.legend(handles=[trend_handle], title="performance", loc="upper left",
+                          bbox_to_anchor=(0.83, 0.66), fontsize=9, title_fontsize=9,
+                          frameon=False)
+    fig.add_artist(leg_perf)
+    fig.legend(handles=size_handles, title="%ADV", loc="upper left",
+               bbox_to_anchor=(0.83, 0.50), fontsize=9, title_fontsize=9,
                labelspacing=1.5, borderpad=0.8, handletextpad=1.2, frameon=False)
     fig.savefig(png)
     plt.close(fig)
@@ -919,11 +937,15 @@ def _fig_table(df: pd.DataFrame, title: str, note: str | None = None,
             disp[c] = disp[c].astype(str)
     # shorter headers so wide tables don't overlap in the fixed-width figure
     abbrev = {
-        "Arrival Slippage (bps)": "Arrival\n(bps)",
-        "Open Slippage (bps)": "Open\n(bps)",
-        "Close Slippage (bps)": "Close\n(bps)",
-        "PVWAP Slippage (bps)": "PVWAP\n(bps)",
-        "Fill Rate (%)": "Fill %",
+        "Arrival Slippage (bps)": "Arrival\nSlippage (bps)",
+        "Open Slippage (bps)": "Open\nSlippage (bps)",
+        "Close Slippage (bps)": "Close\nSlippage (bps)",
+        "PVWAP Slippage (bps)": "PVWAP\nSlippage (bps)",
+        "Fill Rate (%)": "Fill Rate\n(%)",
+        "Dark Exec (%)": "Dark\nExec (%)",
+        "Auction Exec (%)": "Auction\nExec (%)",
+        "Take Exec (%)": "Take\nExec (%)",
+        "Post Exec (%)": "Post\nExec (%)",
         "Spread (bps)": "Spread\n(bps)",
         "Notional (USD m)": "Notional\n(USD m)",
         "Avg Spread (bps)": "Avg Sprd\n(bps)",
@@ -949,42 +971,14 @@ def _fig_table(df: pd.DataFrame, title: str, note: str | None = None,
 
 def build_pdf(path: Path, ctx: dict) -> None:
     with PdfPages(path) as pdf:
-        # ---- cover page ----
-        fig = plt.figure(figsize=(11.69, 8.27))
-        fig.patch.set_facecolor(ACC4)
-        fig.text(0.06, 0.66, "Transaction Cost Analysis", fontsize=34,
-                 fontweight="bold", color="white")
-        fig.text(0.06, 0.58, ctx["client"], fontsize=22, color="#E9C46A")
-        fig.text(0.06, 0.52, ctx["period"], fontsize=14, color="#CBD5D1")
-        s = ctx["sv"]
-        fig.text(0.06, 0.34,
-                 f"{ctx['n_orders']:,} orders   ·   {_fmt_usd(s['total_notional'])} executed"
-                 f"   ·   {s['wtd_dark_pct']:.1f}% dark participation",
-                 fontsize=13, color="white")
-        fig.text(0.06, 0.06, "+ = outperformance / − = cost (bps)   ·   "
-                 "weights = executed notional (USD)", fontsize=10, color="#9FB0AC")
-        pdf.savefig(fig, facecolor=fig.get_facecolor())
-        plt.close(fig)
-
-        # ---- exec summary text ----
-        fig = plt.figure(figsize=(11.69, 8.27))
-        fig.text(0.06, 0.92, "Executive summary", fontsize=17, fontweight="bold", color=INK)
-        y = 0.83
-        for b in ctx["summary_bullets"]:
-            fig.text(0.07, y, "•", fontsize=13, color=DARKC)
-            fig.text(0.09, y, b, fontsize=12, color=INK)
-            y -= 0.075
-        pdf.savefig(fig)
-        plt.close(fig)
-
+        # (cover slide and executive-summary page removed by request — the PDF now
+        #  opens straight on the table pages.)
         # ---- table pages ----
         pdf.savefig(_fig_table(ctx["ot_all"], "1 · Total slippage breakdown by order type",
                                "All strategies · notional-weighted · + = good / − = cost"))
         plt.close("all")
-        pdf.savefig(_fig_table(ctx["ot_strat"],
-                               "2 · Slippage breakdown by order type per strategy — overview",
-                               "Notional-weighted · + = good / − = cost"))
-        plt.close("all")
+        # (the per-strategy "overview" page was dropped — the 2.x pages below already
+        #  show each strategy's order-type breakdown.)
         for i, (strat, tbl) in enumerate(ctx["ot_strat_split"].items(), start=1):
             pdf.savefig(_fig_table(tbl, f"2.{i} · Order type breakdown — {strat}",
                                    "Notional-weighted · + = good / − = cost"))
@@ -1248,38 +1242,26 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- charts ----
     charts = []
-    charts.append((chart_ordertype(ot_all, png_dir / "01_ordertype_slippage.png"),
-                   "Slippage by order type"))
-    charts.append((chart_dark_slippage(dark_tbl, png_dir / "02_dark_slippage.png"),
-                   "More dark → better execution"))
-    charts.append((chart_dark_spreadnorm(dark_tbl, png_dir / "03_dark_spreadnorm.png"),
-                   "Spread capture vs dark"))
-    charts.append((chart_dark_by_size(dark_size_tbl, png_dir / "04_dark_by_size.png"),
-                   "Dark benefit by order size"))
-    charts.append((chart_savings(sv, png_dir / "05_dark_savings.png"),
-                   "The dark opportunity"))
+    # Charts 01 / 03 / 04 / 05 / 09 disabled by request — only 02, 06, 07, 08 are emitted.
+    # (The underlying tables are still produced in the PDF/XLSX; only the PNGs are dropped.)
+    # every active chart bakes its own title in, so pass "" to avoid a duplicate
+    # page title in the PDF/XLSX (doublon).
+    charts.append((chart_dark_slippage(dark_tbl, png_dir / "02_dark_slippage.png"), ""))
     dark_perf_png = chart_algo_dark_perf(df, png_dir / "06_algo_dark_perf.png")
     if dark_perf_png is not None:
         # title + subtitle are baked into this figure; pass "" so the PDF/XLSX
         # don't stack a duplicate page title on top of it
         charts.append((dark_perf_png, ""))
     if venue is not None:
-        charts.append((chart_venue_split(venue, png_dir / "07_venue_split.png"),
-                       "Routed vs executed by venue"))
+        charts.append((chart_venue_split(venue, png_dir / "07_venue_split.png"), ""))
     else:
         print("  ! skipped venue-split chart: need dark_routed.csv and/or dark_executed.csv "
               "in --aux-dir, each with a venue column and a 'Routed %' / 'Executed %' column.")
     if venue_summary is not None:
-        charts.append((chart_venue_summary(venue_summary, png_dir / "08_venue_summary.png"),
-                       "Dark venue summary"))
+        charts.append((chart_venue_summary(venue_summary, png_dir / "08_venue_summary.png"), ""))
     else:
         print("  ! skipped venue-summary chart: need dark_venue_summary.csv in --aux-dir "
               "with a 'Venue Category' column and a '% Total Exec Value' / 'Shares' column.")
-    if algo is not None:
-        charts.append((chart_algo(algo, png_dir / "09_algo_summary.png"),
-                       "Performance by algorithm"))
-    else:
-        print("  ! skipped algo-summary chart: need algo_summary.csv in --aux-dir.")
     print(f"Wrote {len(charts)} chart(s) -> {png_dir}")
 
     summary_bullets = build_summary_bullets(df, ot_all, dark_tbl, sv)

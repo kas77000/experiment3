@@ -46,9 +46,13 @@ def make_orders(n: int, seed: int) -> pd.DataFrame:
     strategy = rng.choice(STRATEGIES, n, p=[0.34, 0.14, 0.12, 0.10, 0.16, 0.14])
     market_limit = rng.choice(MKT_LIMIT, n, p=[0.58, 0.42])
     side = rng.choice(SIDES, n)
+    auction_only = rng.choice(AUCTION, n, p=[0.6, 0.2, 0.15, 0.05])
 
-    # order size in %ADV: right-skewed
-    pct_dv = np.round(rng.lognormal(mean=0.6, sigma=0.9, size=n), 2).clip(0.05, 45)
+    # %adv: order participation as a fraction of ADV -- the REAL %ADV. Right-skewed.
+    # (The legacy %DV column below is kept for back-compat but is NOT the %ADV.)
+    pct_adv = np.round(rng.lognormal(mean=0.6, sigma=0.9, size=n), 2).clip(0.05, 45)
+    # %DV: legacy order-value column, retained but no longer used as %ADV.
+    pct_dv = np.round(rng.lognormal(mean=0.7, sigma=0.9, size=n), 2).clip(0.05, 60)
     vol = np.round(rng.normal(28, 9, n).clip(8, 70), 1)          # annualised vol %
     sprd = np.round(rng.lognormal(mean=1.6, sigma=0.5, size=n), 1).clip(1.5, 60)
 
@@ -66,9 +70,9 @@ def make_orders(n: int, seed: int) -> pd.DataFrame:
     is_bps = (
         2.0
         - 0.35 * sprd
-        - 0.20 * pct_dv
+        - 0.20 * pct_adv
         - 0.05 * (vol - 28)
-        + dark_benefit * (6 + 0.30 * sprd + 0.25 * pct_dv)   # <- dark recaptures
+        + dark_benefit * (6 + 0.30 * sprd + 0.25 * pct_adv)   # <- dark recaptures
         + noise
     )
     # pvwap slippage: tighter, also improved by dark (spread capture)
@@ -90,6 +94,34 @@ def make_orders(n: int, seed: int) -> pd.DataFrame:
     price = rng.uniform(5, 300, n)
     mln = np.round(shares * 1000 * price / 1e6, 3)             # $Mln
 
+    # ---- participation split: %POST + %TAKE + %OPEN + %CLOSE + %DARK == 100 ------
+    # Whatever isn't executed dark is shared across lit-passive (%POST),
+    # lit-aggressive (%TAKE), the opening auction (%OPEN) and the closing auction
+    # (%CLOSE). Dirichlet weights are tilted by strategy / auction preference.
+    #   columns of alpha: [post, take, open, close]
+    alpha = np.column_stack([
+        np.full(n, 3.0),                                       # post (passive lit)
+        np.full(n, 2.0),                                       # take (aggressive lit)
+        np.full(n, 0.6),                                       # open auction
+        np.full(n, 1.2),                                       # close auction
+    ])
+    alpha[:, 0] += np.where(market_limit == "Limit", 1.5, 0.0)     # limit -> more passive
+    alpha[:, 1] += np.where(strategy == "IS", 1.5, 0.0)            # IS -> more aggressive
+    alpha[:, 2] += np.where(auction_only == "OpenOnly", 4.0, 0.0)  # open auction
+    alpha[:, 2] += np.where(auction_only == "Mixed", 0.8, 0.0)
+    alpha[:, 3] += np.where(strategy == "CLOSE", 6.0, 0.0)         # close-strat -> close cross
+    alpha[:, 3] += np.where(auction_only == "CloseOnly", 4.0, 0.0)
+    alpha[:, 3] += np.where(auction_only == "Mixed", 0.8, 0.0)
+
+    frac = rng.gamma(alpha)                                   # (n, 4) gamma draws
+    frac = frac / frac.sum(axis=1, keepdims=True)             # each row sums to 1
+    remaining = 100.0 - dark                                  # non-dark share of the order
+    pct_post = np.round(frac[:, 0] * remaining, 1)
+    pct_take = np.round(frac[:, 1] * remaining, 1)
+    pct_open = np.round(frac[:, 2] * remaining, 1)
+    pct_close = np.round(frac[:, 3] * remaining, 1)
+    pct_auction = np.round(pct_open + pct_close, 1)           # %AUCTION = %OPEN + %CLOSE
+
     def tod(h_lo, h_hi):
         h = rng.integers(h_lo, h_hi, n)
         m = rng.integers(0, 60, n)
@@ -110,12 +142,18 @@ def make_orders(n: int, seed: int) -> pd.DataFrame:
         "Strategy": strategy,
         "Cap": rng.choice(CAPS, n, p=[0.55, 0.30, 0.15]),
         "sector": rng.choice(SECTORS, n),
-        "auctionOnly": rng.choice(AUCTION, n, p=[0.6, 0.2, 0.15, 0.05]),
+        "auctionOnly": auction_only,
         "arrivalTime": rng.choice(ARRIVAL, n, p=[0.15, 0.6, 0.15, 0.10]),
         "marketLimit": market_limit,
         "#Shares (x1000)": shares,
         "$Mln (x1000000)": mln,
         "%DV": pct_dv,
+        "%adv": pct_adv,
+        "%POST": pct_post,
+        "%TAKE": pct_take,
+        "%OPEN": pct_open,
+        "%CLOSE": pct_close,
+        "%AUCTION": pct_auction,
         "ePR": epr,
         "FR": fr,
         "Vol": vol,
@@ -180,7 +218,7 @@ def make_algo_summary(orders: pd.DataFrame) -> pd.DataFrame:
             "Exec Value": round(float(w.sum()), 0),
             "%Weight": round(float(w.sum() / tot * 100), 1),
             "Period Part": round(float(g["ePR"].mean()), 1),
-            "%ADV": round(float(wavg("%DV")), 1),
+            "%ADV": round(float(wavg("%adv")), 1),
             "Spread Bps": round(float(g["Sprd"].mean()), 1),
             "Benchmark": "Order PVWAP",
             "Impact Bps": round(float(wavg("Pvwap")), 1),
