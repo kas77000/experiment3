@@ -752,9 +752,10 @@ def chart_algo_dark_perf(df: pd.DataFrame, png: Path, min_orders: int = 5) -> Pa
 
     Only orders that actually executed dark (``%DARK > 0``) are plotted. Each panel
     scatters those orders (x = %DARK, y = the algo's benchmark slippage — VWAP → Order
-    PVWAP, IS/Inline → arrival price, others → arrival by default) and overlays a linear
-    trend line so the dark-vs-performance relationship is visible per strategy. Algos with
-    fewer than ``min_orders`` dark orders are skipped. Returns ``None`` if none qualify.
+    PVWAP, IS/Inline → arrival price, others → arrival by default) as bubbles sized by
+    the order's %ADV, and overlays a linear trend line so the dark-vs-performance
+    relationship is visible per strategy. Algos with fewer than ``min_orders`` dark
+    orders are skipped. Returns ``None`` if none qualify.
     """
     dark = df[df["dark"] > 0]
     panels = []
@@ -762,20 +763,32 @@ def chart_algo_dark_perf(df: pd.DataFrame, png: Path, min_orders: int = 5) -> Pa
         col, ylab = _algo_benchmark(strat)
         x = pd.to_numeric(g["dark"], errors="coerce")
         y = pd.to_numeric(g[col], errors="coerce")
+        adv = pd.to_numeric(g["pct_dv"], errors="coerce")
         m = x.notna() & y.notna()
         if int(m.sum()) >= min_orders:
-            panels.append((str(strat), x[m].to_numpy(), y[m].to_numpy(), ylab))
+            panels.append((str(strat), x[m].to_numpy(), y[m].to_numpy(),
+                           adv[m].to_numpy(), ylab))
     if not panels:
         return None
     panels.sort(key=lambda p: -len(p[1]))               # busiest algos first
+
+    # common bubble-size scale from %ADV (area grows with %ADV; cap outliers at p95)
+    all_adv = np.concatenate([p[3] for p in panels])
+    all_adv = all_adv[np.isfinite(all_adv)]
+    adv_ref = max(float(np.percentile(all_adv, 95)) if all_adv.size else 1.0, 1e-6)
+    SMIN, SMAX = 18.0, 460.0
+
+    def _size(a):
+        a = np.where(np.isfinite(a), a, 0.0)
+        return SMIN + np.clip(a, 0.0, adv_ref) / adv_ref * (SMAX - SMIN)
 
     ncol = min(3, len(panels))
     nrow = int(np.ceil(len(panels) / ncol))
     fig, axes = plt.subplots(nrow, ncol, figsize=(5.4 * ncol, 4.4 * nrow),
                              squeeze=False)
-    for i, (strat, x, y, ylab) in enumerate(panels):
+    for i, (strat, x, y, adv, ylab) in enumerate(panels):
         ax = axes[i // ncol][i % ncol]
-        ax.scatter(x, y, s=30, color=DARKC, alpha=0.5, edgecolor="white",
+        ax.scatter(x, y, s=_size(adv), color=DARKC, alpha=0.45, edgecolor="white",
                    linewidth=0.5, zorder=3)
         if len(x) >= 2 and np.unique(x).size >= 2:
             slope, intercept = np.polyfit(x, y, 1)
@@ -789,11 +802,24 @@ def chart_algo_dark_perf(df: pd.DataFrame, png: Path, min_orders: int = 5) -> Pa
         ax.set_ylabel(ylab, fontsize=10.5)
     for j in range(len(panels), nrow * ncol):           # blank any unused cells
         axes[j // ncol][j % ncol].axis("off")
+
+    # size-reference legend: a few representative %ADV bubbles
+    from matplotlib.lines import Line2D
+    ref_vals = sorted({max(1, int(round(v)))
+                       for v in np.percentile(all_adv, [50, 80, 95])}) if all_adv.size else [1]
+    size_handles = [Line2D([0], [0], marker="o", linestyle="", markerfacecolor=DARKC,
+                           markeredgecolor="white", alpha=0.55,
+                           markersize=np.sqrt(_size(v)), label=f"{v:g}%")
+                    for v in ref_vals]
+
     fig.tight_layout(rect=[0, 0, 1, 0.92])
     fig.suptitle("Order-level performance vs dark execution, by algo",
                  x=0.015, ha="left", y=0.995, fontsize=17, fontweight="bold", color=INK)
-    fig.text(0.015, 0.95, "each dot = one dark-executed order  ·  + = outperformance / − = cost",
-             ha="left", fontsize=10.5, color=MUTED)
+    fig.text(0.015, 0.95, "each bubble = one dark-executed order · size = %ADV · "
+             "+ = outperformance / − = cost", ha="left", fontsize=10.5, color=MUTED)
+    fig.legend(handles=size_handles, title="%ADV", loc="upper right",
+               bbox_to_anchor=(0.995, 0.99), fontsize=9, title_fontsize=9,
+               labelspacing=1.5, borderpad=0.8, handletextpad=1.2, frameon=False)
     fig.savefig(png)
     plt.close(fig)
     return png
