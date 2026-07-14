@@ -212,10 +212,12 @@ def load_orders(path: Path, cost_positive: bool) -> pd.DataFrame:
     df["side"] = (raw[keys["side"]].astype(str).str.strip().str.title()
                   if keys["side"] else "")
     df["sector"] = raw[keys["sector"]].astype(str).str.strip() if keys["sector"] else ""
-    # Country / listing venue from the Bloomberg-style ticker suffix ("01896 HK" -> HK)
+    # Country / listing venue from the ticker suffix: the code after the last "."
+    # ("0700.HK" -> HK), or after a space if there is no dot ("01896 HK" -> HK).
     if keys["sym"]:
-        tok = raw[keys["sym"]].astype(str).str.strip().str.split().str[-1]
-        df["country"] = tok.where(tok.str.fullmatch(r"[A-Za-z]{2,3}"), "Unknown").str.upper()
+        sym = raw[keys["sym"]].astype(str).str.strip()
+        code = sym.str.extract(r"[.\s]\s*([A-Za-z]{1,4})\s*$", expand=False)
+        df["country"] = code.fillna("Unknown").str.upper()
     else:
         df["country"] = "Unknown"
     df["date"] = pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
@@ -349,10 +351,29 @@ DARK_BINS = [-0.01, 5, 15, 30, 50, 100.01]
 DARK_LABELS = ["<5%", "5-15%", "15-30%", "30-50%", "50%+"]
 SIZE_BINS = [-0.01, 1, 5, 15, 1e9]
 SIZE_LABELS = ["<1% ADV", "1-5% ADV", "5-15% ADV", "15%+ ADV"]
+DARK_NBUCKETS = 5  # target number of %DARK buckets when splitting by quantile
 
 
-def dark_bucket(df: pd.DataFrame) -> pd.Series:
-    return pd.cut(df["dark"], bins=DARK_BINS, labels=DARK_LABELS)
+def dark_bucket(df: pd.DataFrame, n: int = DARK_NBUCKETS) -> pd.Series:
+    """Split orders into %DARK buckets that adapt to the data.
+
+    Uses ``n`` quantile (roughly equal-count) buckets so the split lands where the
+    orders actually are — finer resolution in the low range for a book that trades
+    little dark, a wider top bucket for the sparse tail. If %DARK is too concentrated
+    to form at least 3 distinct edges (e.g. almost everything at one value), it falls
+    back to the fixed [<5, 5-15, 15-30, 30-50, 50+] bands.
+    """
+    s = pd.to_numeric(df["dark"], errors="coerce")
+    v = s.dropna()
+    if not v.empty:
+        edges = np.unique(np.round(np.quantile(v, np.linspace(0, 1, n + 1)), 1))
+        if edges.size >= 3:
+            labels = [f"{a:g}–{b:g}%" for a, b in zip(edges[:-1], edges[1:])]
+            cut_edges = edges.astype(float).copy()
+            cut_edges[0] = float(v.min()) - 0.01     # make sure the min/max are captured
+            cut_edges[-1] = float(v.max()) + 0.01
+            return pd.cut(s, bins=cut_edges, labels=labels, include_lowest=True)
+    return pd.cut(s, bins=DARK_BINS, labels=DARK_LABELS)
 
 
 def size_bucket(df: pd.DataFrame) -> pd.Series:
@@ -362,7 +383,7 @@ def size_bucket(df: pd.DataFrame) -> pd.Series:
 def dark_slippage_table(df: pd.DataFrame) -> pd.DataFrame:
     d = df.assign(_b=dark_bucket(df))
     rows = []
-    for b in DARK_LABELS:
+    for b in d["_b"].cat.categories:      # bucket order, adaptive or fixed
         g = d[d["_b"] == b]
         if g.empty:
             continue
@@ -532,7 +553,7 @@ def chart_dark_slippage(tbl: pd.DataFrame, png: Path) -> Path:
     long = tbl.melt(id_vars="%DARK bucket", value_vars=list(labelmap),
                     var_name="Benchmark", value_name="bps")
     long["Benchmark"] = long["Benchmark"].map(labelmap)
-    order = [b for b in DARK_LABELS if b in set(tbl["%DARK bucket"])]
+    order = tbl["%DARK bucket"].tolist()   # table is already in bucket order
 
     fig, ax = plt.subplots(figsize=(12, 6.5))
     sns.barplot(long, x="%DARK bucket", y="bps", hue="Benchmark", order=order,
@@ -557,7 +578,7 @@ def chart_dark_slippage(tbl: pd.DataFrame, png: Path) -> Path:
 
 
 def chart_dark_spreadnorm(tbl: pd.DataFrame, png: Path) -> Path:
-    order = [b for b in DARK_LABELS if b in set(tbl["%DARK bucket"])]
+    order = tbl["%DARK bucket"].tolist()   # table is already in bucket order
     fig, ax = plt.subplots(figsize=(11, 6))
     sns.pointplot(tbl, x="%DARK bucket", y="ePvwap/Sprd", order=order,
                   color=DARKC, markers="o", markersize=11, linewidth=2.6, ax=ax)
@@ -636,7 +657,7 @@ def chart_venue_split(venue: pd.DataFrame, png: Path) -> Path:
             "each venue is one bar · routed and executed shown as two coloured segments")
     ax.grid(axis="x", color=GRID)
     ax.grid(visible=False, axis="y")
-    ax.legend(loc="lower right", title="")
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), title="")
     fig.savefig(png)
     plt.close(fig)
     return png
@@ -1171,7 +1192,9 @@ def main(argv: list[str] | None = None) -> int:
                    "The dark opportunity"))
     dark_perf_png = chart_algo_dark_perf(df, png_dir / "06_algo_dark_perf.png")
     if dark_perf_png is not None:
-        charts.append((dark_perf_png, "Performance vs dark execution by algo"))
+        # title + subtitle are baked into this figure; pass "" so the PDF/XLSX
+        # don't stack a duplicate page title on top of it
+        charts.append((dark_perf_png, ""))
     if venue is not None:
         charts.append((chart_venue_split(venue, png_dir / "07_venue_split.png"),
                        "Routed vs executed by venue"))
