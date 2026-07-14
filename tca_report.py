@@ -555,8 +555,8 @@ def chart_ordertype(tbl: pd.DataFrame, png: Path) -> Path:
     ax.set_ylabel("Notional-weighted slippage (bps)")
     _titles(ax, "Slippage by order type  ·  all strategies",
             "+ = outperformance   ·   − = cost")
-    ax.legend(title="Order type", ncol=len(types), loc="lower center",
-              bbox_to_anchor=(0.5, -0.20))
+    ax.legend(title="Order type", ncol=len(types), loc="upper center",
+              bbox_to_anchor=(0.5, -0.14), fontsize=9.5, title_fontsize=10)
     fig.savefig(png)
     plt.close(fig)
     return png
@@ -587,7 +587,7 @@ def chart_dark_slippage(tbl: pd.DataFrame, png: Path) -> Path:
     for xi, b in enumerate(order):
         ax.annotate(f"n={int(counts[b])}", (xi, 0), xytext=(0, -22),
                     textcoords="offset points", ha="center", color=MUTED, fontsize=9)
-    ax.legend(loc="upper left", title="")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=10, title="")
     fig.savefig(png)
     plt.close(fig)
     return png
@@ -635,7 +635,7 @@ def chart_dark_by_size(tbl: pd.DataFrame, png: Path) -> Path:
     ax.set_ylabel("Arrival slippage (bps)")
     _titles(ax, "Dark helps most on the hardest (largest) orders",
             "notional-weighted arrival slippage · low vs high dark, by order size")
-    ax.legend(loc="lower left", title="")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=10, title="")
     fig.savefig(png)
     plt.close(fig)
     return png
