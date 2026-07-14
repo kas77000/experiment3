@@ -358,7 +358,7 @@ SIZE_LABELS = ["<1% ADV", "1-5% ADV", "5-15% ADV", "15%+ ADV"]
 # These are just the interior cut-points, in %; edit this list to change the ranges:
 #   [30, 60]          -> "0–30%", "30–60%", "60%+"
 #   [10, 25, 40, 60]  -> "0–10%", "10–25%", "25–40%", "40–60%", "60%+"
-DARK_FIXED_CUTS = [30, 60]
+DARK_FIXED_CUTS = [20, 40]
 
 
 def _dark_labels(cuts: list[float]) -> list[str]:
@@ -809,9 +809,10 @@ def chart_algo_dark_perf(df: pd.DataFrame, png: Path, min_orders: int = 5) -> Pa
             xs = np.linspace(x.min(), x.max(), 50)
             ax.plot(xs, intercept + slope * xs, color=LITC, lw=2.6, zorder=4,
                     label=f"trend  {slope:+.3f} bps / %dark")
-            ax.legend(loc="best", fontsize=9)
+            ax.legend(loc="upper right", fontsize=9, frameon=True, facecolor="white",
+                      framealpha=0.75, edgecolor="none")
         ax.axhline(0, color=MUTED, lw=1.1, ls=(0, (4, 3)))
-        ax.set_title(f"{strat}   ·   n={len(x)}", loc="left", fontsize=13.5)
+        ax.set_title(f"{strat}", loc="left", fontsize=13.5)
         ax.set_xlabel("Dark execution (%DARK)")
         ax.set_ylabel(ylab, fontsize=10.5)
     for j in range(len(panels), nrow * ncol):           # blank any unused cells
