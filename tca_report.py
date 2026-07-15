@@ -154,6 +154,8 @@ ORDER_FIELDS = {
     "post":         ["%POST"],           # lit passive execution share
     "take":         ["%TAKE"],           # lit aggressive execution share
     "auc":          ["%AUCTION"],        # auction execution share (= %OPEN + %CLOSE)
+    "pct_open":     ["%OPEN"],            # opening-auction share (fallback for %AUCTION)
+    "pct_close":    ["%CLOSE"],           # closing-auction share (fallback for %AUCTION)
 }
 
 # slippage columns that get sign-flipped when --cost-positive is set
@@ -243,6 +245,12 @@ def load_orders(path: Path, cost_positive: bool) -> pd.DataFrame:
     df["post"] = _as_pct(_num(raw, keys["post"]))
     df["take"] = _as_pct(_num(raw, keys["take"]))
     df["auc"] = _as_pct(_num(raw, keys["auc"]))
+    # If no combined %AUCTION column exists, derive it from %OPEN + %CLOSE.
+    if df["auc"].isna().all():
+        op = _as_pct(_num(raw, keys["pct_open"]))
+        cl = _as_pct(_num(raw, keys["pct_close"]))
+        if not (op.isna().all() and cl.isna().all()):
+            df["auc"] = op.add(cl, fill_value=0.0)
     return df
 
 
