@@ -1051,7 +1051,10 @@ def build_xlsx(path: Path, ctx: dict) -> None:
                         cell.number_format = "+0.0;-0.0"
         # column widths
         for j, col in enumerate(df.columns, start=1):
-            width = max(11, min(30, int(df[col].astype(str).str.len().max() if len(df) else 10) + 2,
+            maxlen = df[col].astype(str).str.len().max() if len(df) else 10
+            if pd.isna(maxlen):
+                maxlen = 10
+            width = max(11, min(30, int(maxlen) + 2,
                                 len(str(col)) + 4))
             ws.column_dimensions[get_column_letter(j)].width = max(width, len(str(col)) + 3)
         return header_row + len(df) + 3  # next free row
