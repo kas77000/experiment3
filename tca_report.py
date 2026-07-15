@@ -1021,6 +1021,22 @@ def _fig_from_png(png: Path, title: str | None = None) -> plt.Figure:
     return fig
 
 
+def _wrap_header(label: str, max_chars: int = 10) -> str:
+    """Break a long multi-word column header over two balanced lines so it fits in a
+    fixed-width table cell (single-line headers like 'Wgt Impact Bps' otherwise overflow
+    and get clipped). Short or single-word headers are returned unchanged."""
+    s = str(label)
+    if len(s) <= max_chars or " " not in s:
+        return s
+    words = s.split()
+    best_i, best_diff = 1, None
+    for i in range(1, len(words)):
+        diff = abs(len(" ".join(words[:i])) - len(" ".join(words[i:])))
+        if best_diff is None or diff < best_diff:
+            best_i, best_diff = i, diff
+    return " ".join(words[:best_i]) + "\n" + " ".join(words[best_i:])
+
+
 def _fig_table(df: pd.DataFrame, title: str, note: str | None = None,
                float_fmt: str = "{:.1f}") -> plt.Figure:
     fig = plt.figure(figsize=(11.69, 8.27))
@@ -1060,7 +1076,7 @@ def _fig_table(df: pd.DataFrame, title: str, note: str | None = None,
         "High dark (>=30%) bps": "High dark\n(≥30%)",
         "Dark benefit (bps)": "Dark\nbenefit",
     }
-    labels = [abbrev.get(c, c) for c in disp.columns]
+    labels = [abbrev.get(c) or _wrap_header(c) for c in disp.columns]
     tbl = ax.table(cellText=disp.values, colLabels=labels,
                    cellLoc="center", loc="upper center")
     tbl.auto_set_font_size(False)
