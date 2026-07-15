@@ -313,7 +313,7 @@ def ordertype_per_strategy(df: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(["Strategy", "Order Type"]).reset_index(drop=True)
 
 
-BREAKDOWN_METRICS = ["# Orders", "Arrival Slippage (bps)", "PVWAP Slippage (bps)",
+BREAKDOWN_METRICS = ["# Orders", "Notional (USD m)", "Arrival Slippage (bps)", "PVWAP Slippage (bps)",
                      "%ADV", "Volatility", "Spread (bps)", "Fill Rate (%)",
                      "Dark Exec (%)", "Auction Exec (%)", "Take Exec (%)", "Post Exec (%)"]
 
@@ -322,6 +322,7 @@ def _breakdown_row(g: pd.DataFrame) -> dict:
     w = g["notional"]
     return {
         "# Orders": len(g),
+        "Notional (USD m)": float(w.sum()) / 1e6,
         "Arrival Slippage (bps)": wavg(g["is"], w),
         "PVWAP Slippage (bps)": wavg(g["pvwap"], w),
         "%ADV": float(g["pct_dv"].mean()),
@@ -940,7 +941,13 @@ def _fig_table(df: pd.DataFrame, title: str, note: str | None = None,
     disp = df.copy()
     for c in disp.columns:
         if pd.api.types.is_float_dtype(disp[c]):
-            disp[c] = disp[c].map(lambda v: float_fmt.format(v) if np.isfinite(v) else "")
+            # large whole-number columns (e.g. Exec Value) read better with thousands
+            # separators and no decimals than with the default 1-dp float format
+            finite = disp[c].dropna()
+            if not finite.empty and (finite.abs() >= 1e4).all() and (finite % 1 == 0).all():
+                disp[c] = disp[c].map(lambda v: f"{v:,.0f}" if np.isfinite(v) else "")
+            else:
+                disp[c] = disp[c].map(lambda v: float_fmt.format(v) if np.isfinite(v) else "")
         else:
             disp[c] = disp[c].astype(str)
     # shorter headers so wide tables don't overlap in the fixed-width figure
@@ -979,8 +986,23 @@ def _fig_table(df: pd.DataFrame, title: str, note: str | None = None,
 
 def build_pdf(path: Path, ctx: dict) -> None:
     with PdfPages(path) as pdf:
-        # (cover slide and executive-summary page removed by request — the PDF now
-        #  opens straight on the table pages.)
+        # ---- cover page ----
+        s = ctx["sv"]
+        fig = plt.figure(figsize=(11.69, 8.27))
+        fig.patch.set_facecolor(ACC4)
+        fig.text(0.06, 0.66, "Transaction Cost Analysis", fontsize=34,
+                 fontweight="bold", color="white")
+        fig.text(0.06, 0.58, ctx["client"], fontsize=22, color="#E9C46A")
+        fig.text(0.06, 0.52, ctx["period"], fontsize=14, color="#CBD5D1")
+        fig.text(0.06, 0.34,
+                 f"{ctx['n_orders']:,} orders   ·   {_fmt_usd(s['total_notional'])} executed"
+                 f"   ·   {s['wtd_dark_pct']:.1f}% dark participation",
+                 fontsize=13, color="white")
+        fig.text(0.06, 0.06, "+ = outperformance / − = cost (bps)   ·   "
+                 "weights = executed notional (USD)", fontsize=10, color="#9FB0AC")
+        pdf.savefig(fig, facecolor=fig.get_facecolor())
+        plt.close(fig)
+
         # ---- table pages ----
         pdf.savefig(_fig_table(ctx["ot_all"], "1 · Total slippage breakdown by order type",
                                "All strategies · notional-weighted · + = good / − = cost"))
@@ -1000,6 +1022,10 @@ def build_pdf(path: Path, ctx: dict) -> None:
         pdf.savefig(_fig_table(ctx["algo_tbl"], "5 · Slippage & dark participation by algo",
                                "Notional-weighted · + = good / − = cost · %DARK weighted by notional"))
         plt.close("all")
+        if ctx.get("algo") is not None:
+            pdf.savefig(_fig_table(ctx["algo"], "6 · Performance summary by algorithm",
+                                   "Source: algo_summary.csv"))
+            plt.close("all")
 
         # ---- chart pages ----
         for png, title in ctx["pdf_charts"]:
