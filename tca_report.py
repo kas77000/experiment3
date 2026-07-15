@@ -222,6 +222,7 @@ def load_orders(path: Path, cost_positive: bool) -> pd.DataFrame:
     df["side"] = (raw[keys["side"]].astype(str).str.strip().str.title()
                   if keys["side"] else "")
     df["sector"] = raw[keys["sector"]].astype(str).str.strip() if keys["sector"] else ""
+    df["sym"] = raw[keys["sym"]].astype(str).str.strip() if keys["sym"] else ""
     # Country / listing venue = the last 2 characters of the ticker
     # ("0700.HK" / "01896 HK" -> HK, "AAPL.US" -> US).
     if keys["sym"]:
@@ -870,6 +871,97 @@ def chart_algo_dark_perf(df: pd.DataFrame, png: Path, min_orders: int = 5) -> Pa
     return png
 
 
+# best / worst orders shown in each strategy panel of the outlier chart
+OUTLIER_N = 2
+# short x-axis label per benchmark column used by the outlier chart
+_OUTLIER_XLAB = {
+    "pvwap":  "PVWAP slippage (bps)",
+    "is":     "Arrival slippage (bps)",
+    "close":  "Close slippage (bps)",
+    "open":   "Open slippage (bps)",
+    "epvwap": "ePVWAP slippage (bps)",
+}
+
+
+def _order_label(row: pd.Series) -> str:
+    """Human-readable order identifier: '<Sym> <SIDE> <dd/mm/yy>' from what's available."""
+    parts = []
+    sym = str(row.get("sym", "") or "").strip()
+    if sym:
+        parts.append(sym)
+    side = str(row.get("side", "") or "").strip()
+    if side:
+        parts.append(side.upper())
+    d = row.get("date")
+    if isinstance(d, pd.Timestamp) and pd.notna(d):
+        parts.append(f"{d:%d/%m/%y}")
+    return " ".join(parts) or "(order)"
+
+
+def chart_outliers_by_strategy(df: pd.DataFrame, png: Path, n: int = OUTLIER_N,
+                               min_orders: int = 1) -> Path | None:
+    """Small-multiples, one horizontal-bar panel per strategy: the ``n`` best and ``n``
+    worst orders by that strategy's benchmark slippage (VWAP → Order PVWAP, IS/Inline →
+    arrival price, others → arrival by default). Positive (outperformance) bars are blue,
+    negative (cost) bars red. Returns ``None`` if no strategy has a scored order.
+    """
+    POS, NEG = "#3B6FA0", "#C0453B"
+    panels = []
+    for strat, g in df.groupby("strategy", observed=True):
+        col, ylab = _algo_benchmark(strat)
+        v = pd.to_numeric(g[col], errors="coerce")
+        gg = g.assign(_v=v).dropna(subset=["_v"])
+        if len(gg) < min_orders:
+            continue
+        gg = gg.sort_values("_v")
+        pick = pd.concat([gg.head(n), gg.tail(n)])          # n worst + n best
+        pick = pick[~pick.index.duplicated()].sort_values("_v")
+        labels = [_order_label(r) for _, r in pick.iterrows()]
+        vals = pick["_v"].to_numpy(dtype=float)
+        panels.append((str(strat), labels, vals, _OUTLIER_XLAB.get(col, ylab)))
+    if not panels:
+        return None
+    panels.sort(key=lambda p: p[0])                          # stable, alphabetical
+
+    ncol = min(4, len(panels))
+    nrow = int(np.ceil(len(panels) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5.2 * ncol, 3.6 * nrow),
+                             squeeze=False)
+    for i, (strat, labels, vals, xlab) in enumerate(panels):
+        ax = axes[i // ncol][i % ncol]
+        y = np.arange(len(vals))
+        colors = [POS if x >= 0 else NEG for x in vals]
+        ax.barh(y, vals, color=colors, edgecolor="white", linewidth=0.6, zorder=3)
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.axvline(0, color=MUTED, lw=1.0)
+        ax.set_title(strat, loc="center", fontsize=12, fontweight="bold")
+        ax.set_xlabel(xlab, fontsize=9)
+        ax.tick_params(axis="x", labelsize=8)
+        # headroom on the bar side(s) so the value labels don't clip
+        span = float(max(np.abs(vals).max(), 1.0))
+        ax.set_xlim(-span * 1.35 if (vals < 0).any() else -span * 0.05,
+                    span * 1.35 if (vals > 0).any() else span * 0.05)
+        for yi, xv in zip(y, vals):
+            ax.text(xv + np.sign(xv or 1) * span * 0.03, yi, f"{xv:+.1f}",
+                    va="center", ha="left" if xv >= 0 else "right",
+                    fontsize=8, color=INK, zorder=4)
+    for j in range(len(panels), nrow * ncol):               # blank unused cells
+        axes[j // ncol][j % ncol].axis("off")
+
+    from matplotlib.patches import Patch
+    handles = [Patch(facecolor=POS, label="Positive slippage (outperformance)"),
+               Patch(facecolor=NEG, label="Negative slippage (cost)")]
+    fig.suptitle(f"Top-{n} / Bottom-{n} outliers by slippage per strategy",
+                 x=0.01, ha="left", fontsize=16, fontweight="bold", color=INK)
+    fig.legend(handles=handles, loc="lower center", ncol=2, frameon=False,
+               fontsize=10, bbox_to_anchor=(0.5, -0.02))
+    fig.tight_layout(rect=[0, 0.03, 1, 0.96])
+    fig.savefig(png)
+    plt.close(fig)
+    return png
+
+
 def chart_savings(sv: dict, png: Path) -> Path:
     """Callout figure summarising the dark opportunity."""
     fig, ax = plt.subplots(figsize=(11, 5.5))
@@ -1284,6 +1376,10 @@ def main(argv: list[str] | None = None) -> int:
     # every active chart bakes its own title in, so pass "" to avoid a duplicate
     # page title in the PDF/XLSX (doublon).
     charts.append((chart_dark_slippage(dark_tbl, png_dir / "02_dark_slippage.png"), ""))
+    outliers_png = chart_outliers_by_strategy(df, png_dir / "10_outliers_by_strategy.png")
+    if outliers_png is not None:
+        # the figure bakes its own title in; pass "" to avoid a duplicate page title
+        charts.append((outliers_png, ""))
     dark_perf_png = chart_algo_dark_perf(df, png_dir / "06_algo_dark_perf.png")
     if dark_perf_png is not None:
         # title + subtitle are baked into this figure; pass "" so the PDF/XLSX
